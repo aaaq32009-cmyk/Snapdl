@@ -1,0 +1,226 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/res/layout app/src/main/java/com/example/snapdl
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SnapDL"
+          include(":app")
+          EOF
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.snapdl"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.snapdl"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
+              }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+              // yt-dlp for Android (check the latest version on GitHub: yausername/youtubedl-android)
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="SnapDL"
+                  android:extractNativeLibs="true"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Receive links via Share from any app -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:padding="20dp">
+
+              <EditText android:id="@+id/urlInput" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:hint="الصق الرابط هنا"
+                  android:inputType="textUri" />
+
+              <CheckBox android:id="@+id/audioOnly" android:layout_width="wrap_content"
+                  android:layout_height="wrap_content" android:text="صوت فقط (MP3)" />
+
+              <Button android:id="@+id/downloadBtn" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:text="تحميل" />
+
+              <ProgressBar android:id="@+id/bar" style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:layout_marginTop="16dp" android:max="100" />
+
+              <TextView android:id="@+id/status" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:layout_marginTop="12dp"
+                  android:text="جاهز" />
+
+              <Button android:id="@+id/updateBtn" android:layout_width="match_parent"
+                  android:layout_height="wrap_content" android:layout_marginTop="24dp"
+                  android:text="تحديث المحرك (yt-dlp)" />
+          </LinearLayout>
+          EOF
+          cat > app/src/main/java/com/example/snapdl/MainActivity.kt << 'EOF'
+          package com.example.snapdl
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Environment
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var urlInput: EditText
+              private lateinit var audioOnly: CheckBox
+              private lateinit var bar: ProgressBar
+              private lateinit var status: TextView
+              private var ready = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  urlInput = findViewById(R.id.urlInput)
+                  audioOnly = findViewById(R.id.audioOnly)
+                  bar = findViewById(R.id.bar)
+                  status = findViewById(R.id.status)
+
+                  // Link shared from another app (YouTube, TikTok, browser...)
+                  if (intent?.action == Intent.ACTION_SEND) {
+                      urlInput.setText(intent.getStringExtra(Intent.EXTRA_TEXT) ?: "")
+                  }
+
+                  // Initialize the engine in the background
+                  status.text = "جاري تجهيز المحرك..."
+                  lifecycleScope.launch(Dispatchers.IO) {
+                      try {
+                          YoutubeDL.getInstance().init(application)
+                          FFmpeg.getInstance().init(application)
+                          ready = true
+                          withContext(Dispatchers.Main) { status.text = "جاهز" }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) { status.text = "فشل التجهيز: ${e.message}" }
+                      }
+                  }
+
+                  findViewById<Button>(R.id.downloadBtn).setOnClickListener { download() }
+                  findViewById<Button>(R.id.updateBtn).setOnClickListener { updateEngine() }
+              }
+
+              private fun download() {
+                  val url = urlInput.text.toString().trim()
+                  if (url.isEmpty()) { toast("الصق رابط الأول"); return }
+                  if (!ready) { toast("المحرك لسه بيجهز"); return }
+
+                  val dir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "SnapDL").apply { mkdirs() }
+                  val req = YoutubeDLRequest(url).apply {
+                      addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
+                      if (audioOnly.isChecked) {
+                          addOption("-x"); addOption("--audio-format", "mp3")
+                      } else {
+                          addOption("-f", "bv*[height<=1080]+ba/b")
+                          addOption("--merge-output-format", "mp4")
+                      }
+                  }
+
+                  status.text = "جاري التحميل..."
+                  lifecycleScope.launch(Dispatchers.IO) {
+                      try {
+                          YoutubeDL.getInstance().execute(req, "snapdl") { progress, _, line ->
+                              runOnUiThread { bar.progress = progress.toInt(); status.text = line }
+                          }
+                          withContext(Dispatchers.Main) {
+                              bar.progress = 100
+                              status.text = "تم التحميل في:\n${dir.absolutePath}"
+                          }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) { status.text = "خطأ: ${e.message}" }
+                      }
+                  }
+              }
+
+              private fun updateEngine() {
+                  if (!ready) return
+                  status.text = "جاري تحديث yt-dlp..."
+                  lifecycleScope.launch(Dispatchers.IO) {
+                      val msg = try {
+                          YoutubeDL.getInstance().updateYoutubeDL(application, YoutubeDL.UpdateChannel.STABLE)
+                          "تم التحديث"
+                      } catch (e: Exception) { "فشل التحديث: ${e.message}" }
+                      withContext(Dispatchers.Main) { status.text = msg }
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SnapDL-apk
+          path: app/build/outputs/apk/debug/*.apk
